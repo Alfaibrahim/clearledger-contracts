@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger as _},
     xdr::ToXdr,
-    Address, Bytes, BytesN, Env, Map, String, Symbol, TryFromVal,
+    Address, Bytes, BytesN, Env, Map, String, Symbol, TryFromVal, Vec,
 };
 use clearledger_escrow::EscrowContractClient;
 use clearledger_invoice::InvoiceContractClient;
@@ -15,8 +15,9 @@ use clearledger_pool::PoolContractClient;
 use clearledger_registry::{RegistryContract, RegistryContractClient};
 
 use crate::{
-    DataKey, PoolFactoryContract, PoolFactoryContractClient, DEFAULT_MIN_INITIAL_DEPOSIT,
-    DEFAULT_SHARE_DECIMALS, DEFAULT_SHARE_NAME, DEFAULT_SHARE_SYMBOL,
+    DataKey, PoolFactoryContract, PoolFactoryContractClient, PoolStats,
+    DEFAULT_MIN_INITIAL_DEPOSIT, DEFAULT_SHARE_DECIMALS, DEFAULT_SHARE_NAME, DEFAULT_SHARE_SYMBOL,
+    MAX_AGGREGATE_STATS_PAGE_LIMIT,
 };
 
 /// Everything a test needs to drive the factory, already wired together: an
@@ -632,6 +633,287 @@ fn test_list_assets_multiple() {
     assert_eq!(assets.get(2), Some(asset3));
 }
 
+// ---------------- Aggregate stats pagination ----------------
+
+/// Seeds the asset index and pool mapping exactly as repeated registrations
+/// would, without paying for a pool deploy/initialize per order-sensitive
+/// pagination test. Each asset gets its own mock stats pool so the returned
+/// pair order is observable.
+fn seed_aggregate_assets(
+    env: &Env,
+    factory_id: &Address,
+    assets: &[Address],
+) -> Vec<Address> {
+    // A max-size page makes up to `MAX_AGGREGATE_STATS_PAGE_LIMIT` real
+    // cross-contract calls, which can cross the default test-host budget.
+    env.budget().reset_unlimited();
+    let mut pools = Vec::new(env);
+    for _ in assets {
+        pools.push_back(env.register_contract(None, MockStatsPool));
+    }
+    env.as_contract(factory_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetCount, &(assets.len() as u32));
+        for (index, asset) in assets.iter().enumerate() {
+            let pool = pools.get(index as u32).unwrap();
+            env.storage()
+                .instance()
+                .set(&DataKey::AssetIndex(index as u32), asset);
+            env.storage()
+                .instance()
+                .set(&DataKey::PoolForAsset(asset.clone()), &pool);
+        }
+    });
+    pools
+}
+
+/// Appends one asset and its pool mapping the way `record_pool` does, returning
+/// the new mock pool address.
+fn append_aggregate_asset(env: &Env, factory_id: &Address, asset: &Address) -> Address {
+    let pool = env.register_contract(None, MockStatsPool);
+    env.as_contract(factory_id, || {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AssetCount)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetCount, &(count + 1));
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetIndex(count), asset);
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolForAsset(asset.clone()), &pool);
+    });
+    pool
+}
+
+/// Walks every aggregate-stats page from cursor 0 and concatenates the items.
+fn walk_aggregate_stats(
+    env: &Env,
+    client: &PoolFactoryContractClient<'_>,
+    limit: u32,
+) -> Vec<(Address, PoolStats)> {
+    let mut cursor = 0u32;
+    let mut items = Vec::new(env);
+    loop {
+        let page = client.get_aggregate_stats_page(&cursor, &limit);
+        let mut index = 0;
+        while index < page.items.len() {
+            items.push_back(page.items.get(index).unwrap());
+            index += 1;
+        }
+        match page.next_cursor {
+            Some(next) => cursor = next,
+            None => break,
+        }
+    }
+    items
+}
+
+#[test]
+fn test_get_aggregate_stats_page_empty() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    let page = client.get_aggregate_stats_page(&0, &10);
+    assert_eq!(page.items.len(), 0);
+    assert!(page.next_cursor.is_none());
+}
+
+#[test]
+fn test_get_aggregate_stats_page_first_page() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    let assets = [
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+    let pools = seed_aggregate_assets(&env, &factory_id, &assets);
+
+    let page = client.get_aggregate_stats_page(&0, &2);
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items.get(0).unwrap().0, pools.get(0).unwrap());
+    assert_eq!(page.items.get(1).unwrap().0, pools.get(1).unwrap());
+    assert_eq!(page.next_cursor, Some(2));
+}
+
+#[test]
+fn test_get_aggregate_stats_page_multi_page_walk_has_no_gaps_or_duplicates() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    let assets = [
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+    let pools = seed_aggregate_assets(&env, &factory_id, &assets);
+
+    let walked = walk_aggregate_stats(&env, &client, 2);
+
+    assert_eq!(walked.len(), 5);
+    for (index, pool) in pools.iter().enumerate() {
+        assert_eq!(walked.get(index as u32).unwrap().0, pool);
+    }
+}
+
+#[test]
+fn test_get_aggregate_stats_page_exact_and_max_limit() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    // An exact multiple of the page size ends on a full page whose
+    // `next_cursor` is already `None` rather than an extra empty page.
+    let assets = [
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+    seed_aggregate_assets(&env, &factory_id, &assets);
+
+    let first = client.get_aggregate_stats_page(&0, &2);
+    assert_eq!(first.items.len(), 2);
+    assert_eq!(first.next_cursor, Some(2));
+
+    let last = client.get_aggregate_stats_page(&2, &2);
+    assert_eq!(last.items.len(), 2);
+    assert!(last.next_cursor.is_none());
+
+    // A full max-size request is accepted and bounded by the constant.
+    let max_assets: std::vec::Vec<Address> = (0..MAX_AGGREGATE_STATS_PAGE_LIMIT)
+        .map(|_| Address::generate(&env))
+        .collect();
+    seed_aggregate_assets(&env, &factory_id, &max_assets);
+
+    let page = client.get_aggregate_stats_page(&0, &MAX_AGGREGATE_STATS_PAGE_LIMIT);
+    assert_eq!(page.items.len(), MAX_AGGREGATE_STATS_PAGE_LIMIT);
+    assert!(page.next_cursor.is_none());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_get_aggregate_stats_page_zero_limit_panics() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    client.get_aggregate_stats_page(&0, &0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_get_aggregate_stats_page_limit_above_max_panics() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    client.get_aggregate_stats_page(&0, &(MAX_AGGREGATE_STATS_PAGE_LIMIT + 1));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_get_aggregate_stats_page_cursor_past_end_panics() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    let assets = [Address::generate(&env), Address::generate(&env)];
+    seed_aggregate_assets(&env, &factory_id, &assets);
+
+    client.get_aggregate_stats_page(&3, &2);
+}
+
+#[test]
+fn test_get_aggregate_stats_page_cursor_at_end_is_empty() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    let assets = [Address::generate(&env), Address::generate(&env)];
+    seed_aggregate_assets(&env, &factory_id, &assets);
+
+    // `cursor == count` is a valid, empty final page rather than an error.
+    let page = client.get_aggregate_stats_page(&2, &2);
+    assert_eq!(page.items.len(), 0);
+    assert!(page.next_cursor.is_none());
+}
+
+#[test]
+fn test_get_aggregate_stats_page_append_between_pages() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    let assets = [
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+    let pools = seed_aggregate_assets(&env, &factory_id, &assets);
+
+    let first = client.get_aggregate_stats_page(&0, &2);
+    assert_eq!(first.items.len(), 2);
+    assert_eq!(first.items.get(0).unwrap().0, pools.get(0).unwrap());
+    assert_eq!(first.items.get(1).unwrap().0, pools.get(1).unwrap());
+    assert_eq!(first.next_cursor, Some(2));
+
+    // Registration between reads appends at the end: the already-read items
+    // keep their cursors and the new asset appears on the next page.
+    let appended_asset = Address::generate(&env);
+    let appended_pool = append_aggregate_asset(&env, &factory_id, &appended_asset);
+
+    let second = client.get_aggregate_stats_page(&2, &2);
+    assert_eq!(second.items.len(), 2);
+    assert_eq!(second.items.get(0).unwrap().0, pools.get(2).unwrap());
+    assert_eq!(second.items.get(1).unwrap().0, appended_pool);
+    assert!(second.next_cursor.is_none());
+}
+
+#[test]
+fn test_get_aggregate_stats_page_cursor_advances_past_skipped_pools() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    let assets = [
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+    let pools = seed_aggregate_assets(&env, &factory_id, &assets);
+
+    // Model a corrupt/legacy mapping for the middle asset: its pool call
+    // fails, so it is skipped without stalling the walk.
+    let broken_asset = assets[1].clone();
+    let broken_pool = Address::generate(&env);
+    env.as_contract(&factory_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolForAsset(broken_asset), &broken_pool);
+    });
+
+    let page = client.get_aggregate_stats_page(&0, &3);
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items.get(0).unwrap().0, pools.get(0).unwrap());
+    assert_eq!(page.items.get(1).unwrap().0, pools.get(2).unwrap());
+    assert!(page.next_cursor.is_none());
+}
+
 // --------------- Mock Token for Integration Tests ---------------
 
 use soroban_sdk::{contract, contractimpl, contracttype};
@@ -654,6 +936,29 @@ impl MockToken {
 
     pub fn balance(env: Env, addr: Address) -> i128 {
         env.storage().persistent().get(&TKey(addr)).unwrap_or(0)
+    }
+}
+
+/// Minimal pool stand-in whose only job is to answer the factory's aggregate
+/// `get_stats` cross-contract call, so pagination tests can observe item order
+/// without deploying and initializing a real pool per asset.
+#[contract]
+pub struct MockStatsPool;
+
+#[contractimpl]
+impl MockStatsPool {
+    pub fn get_stats(_env: Env) -> PoolStats {
+        PoolStats {
+            total_deposits: 1,
+            total_funded: 2,
+            available_liquidity: 3,
+            utilization_rate_bps: 4,
+            total_yield_distributed: 5,
+            total_loss_realised: 6,
+            active_invoice_count: 7,
+            total_shares: 8,
+            max_utilization_bps: 9,
+        }
     }
 }
 

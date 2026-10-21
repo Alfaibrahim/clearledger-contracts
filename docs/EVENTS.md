@@ -5,6 +5,22 @@ pagination guidance; event-driven indexing can avoid repeated full-history reads
 
 This document lists every event emitted by the ClearLedger smart contracts. Events are published via `env.events().publish(topics, data)` and are indexed by the Go indexer for off-chain consumption.
 
+## Catalog version and compatibility
+
+This catalog is versioned independently from contract package versions. The current
+catalog version is **1.0**. A catalog version changes whenever an event topic or
+data payload changes, or when a public state transition gains a new event.
+
+Consumers should identify events by the first topic (the event name) and decode the
+documented topic and data shape for the contract version they index. Existing event
+names and fields are retained across compatible releases. New fields are added only
+at the end of a payload or as a new event, while changing a field type, removing a
+field, or reusing an event name requires a catalog version bump and an explicit
+migration note in this document.
+
+Contracts emit events only after the corresponding state transition succeeds. A
+failed authorization or rejected input must not be interpreted as a state event.
+
 ## Indexer migration guidance
 
 Indexers must treat event names as an open set. Unknown topics should be retained
